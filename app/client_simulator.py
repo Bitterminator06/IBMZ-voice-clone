@@ -80,7 +80,7 @@ def main() -> int:
     try:
         token = args.token or _http_json(f"{base_url}/dev/token?" + urllib.parse.urlencode({"sub": args.user_id}))["token"]
         if args.enroll:
-            enrollment = _http_json(f"{base_url}/enroll", {"user_id": args.user_id, "audio_b64": base64.b64encode(audio_path.read_bytes()).decode("ascii")})
+            enrollment = _http_json(f"{base_url}/enroll?" + urllib.parse.urlencode({"token": token}), {"user_id": args.user_id, "audio_b64": base64.b64encode(audio_path.read_bytes()).decode("ascii")})
             print(f"enrolled {json.dumps(enrollment, sort_keys=True)}")
         asyncio.run(stream_file(audio_path, args.host, args.port, token, args.user_id, args.chunk_ms, args.loss))
     except KeyboardInterrupt:
