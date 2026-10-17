@@ -1,0 +1,122 @@
+diff --git a/app/server.py b/app/server.py
+index dd12077..53253b0 100644
+--- a/app/server.py
++++ b/app/server.py
+@@ -52,6 +52,8 @@ import json
+ import traceback
+ import base64
+ import io
++import os
++import sys
+ import wave
+ from typing import Optional
+ 
+@@ -62,7 +64,18 @@ try:
+     _AUDIOOP_AVAILABLE = True
+ except ImportError:  # pragma: no cover
+     _AUDIOOP_AVAILABLE = False
+-    from scipy.signal import resample_poly
++
++# resample_poly is also needed on big-endian hosts even when audioop exists.
++from scipy.signal import resample_poly
++
++# audioop reads native-endian samples; the wire format is PCM16LE. On big-endian
++# hosts (IBM Z / LinuxONE, s390x) fall through to the explicit-LE scipy path.
++if sys.byteorder == "big":
++    _AUDIOOP_AVAILABLE = False
++
++# Wire/PCM contract: explicit little-endian int16 (== np.int16 on x86/ARM only).
++_PCM16LE = np.dtype("<i2")
++
+ from pathlib import Path
+ 
+ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+@@ -100,7 +113,7 @@ STRIDE_SAMPLES = int(SAMPLE_RATE * STRIDE_S)  # 250ms @ 16kHz = 4000 samples
+ 
+ # Loaded once at process start. Pass a real path once a checkpoint exists;
+ # falls back to the explainable DSP heuristic otherwise (see acoustic_model.py).
+-acoustic_model = AcousticModel(model_path=None)
++acoustic_model = AcousticModel(model_path=os.environ.get("TRACK_A_MODEL") or None)
+ fusion_engine = FusionEngine()
+ verifier = SpeakerVerifier()
+ 
+@@ -154,15 +167,15 @@ def pcm16_bytes_to_float32(chunk: bytes, input_sample_rate: int) -> np.ndarray:
+     if input_sample_rate != SAMPLE_RATE:
+         if _AUDIOOP_AVAILABLE:
+             chunk, _ = audioop.ratecv(chunk, 2, 1, input_sample_rate, SAMPLE_RATE, None)
+-            pcm16 = np.frombuffer(chunk, dtype=np.int16)
++            pcm16 = np.frombuffer(chunk, dtype=_PCM16LE)
+         else:
+-            pcm16_in = np.frombuffer(chunk, dtype=np.int16)
++            pcm16_in = np.frombuffer(chunk, dtype=_PCM16LE)
+             up = SAMPLE_RATE // np.gcd(SAMPLE_RATE, input_sample_rate)
+             down = input_sample_rate // np.gcd(SAMPLE_RATE, input_sample_rate)
+             resampled = resample_poly(pcm16_in.astype(np.float32), up, down)
+-            pcm16 = np.clip(resampled, -32768, 32767).astype(np.int16)
++            pcm16 = np.clip(resampled, -32768, 32767).astype(_PCM16LE)
+     else:
+-        pcm16 = np.frombuffer(chunk, dtype=np.int16)
++        pcm16 = np.frombuffer(chunk, dtype=_PCM16LE)
+     return (pcm16.astype(np.float32)) / 32768.0
+ 
+ 
+@@ -285,7 +298,7 @@ async def enroll_voiceprint(request: Request):
+         if channels > 1:
+             pcm = pcm.reshape(-1, channels).mean(axis=1).astype(np.int16)
+         # Normalize enrollment input to the verifier's 16 kHz mono contract.
+-        audio_16k = pcm16_bytes_to_float32(pcm.tobytes(), sample_rate)
++        audio_16k = pcm16_bytes_to_float32(pcm.astype(_PCM16LE).tobytes(), sample_rate)
+         verifier.enroll(user_id, audio_16k)
+         metadata = verifier.enrollment(user_id)
+         if metadata is None:
+diff --git a/app/tests/test_pcm_endianness.py b/app/tests/test_pcm_endianness.py
+new file mode 100644
+index 0000000..02d4de2
+--- /dev/null
++++ b/app/tests/test_pcm_endianness.py
+@@ -0,0 +1,45 @@
++"""
++Byte-order contract for the wire format (PCM16 little-endian).
++
++Passes on every host. On big-endian hosts (IBM Z / LinuxONE, s390x) it fails
++if samples are decoded with the native np.int16 instead of an explicit "<i2".
++Run it first on the LinuxONE VM:  python -m pytest app/tests/test_pcm_endianness.py -v
++"""
++import os
++import sys
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++import numpy as np
++
++import server
++
++
++def _le_bytes(samples):
++    # Explicit LE regardless of host byte order -- this is what a phone/SBC/browser sends.
++    return np.asarray(samples, dtype="<i2").tobytes()
++
++
++def test_pcm16le_decode_16k_is_host_independent():
++    samples = [0, 1, -1, 256, -256, 12345, -12345, 32767, -32768]
++    out = server.pcm16_bytes_to_float32(_le_bytes(samples), 16000)
++    expected = np.array(samples, dtype=np.float32) / 32768.0
++    np.testing.assert_allclose(out, expected, atol=0)
++
++
++def test_pcm16le_decode_8k_resample_is_host_independent():
++    t = np.arange(8000) / 8000.0
++    tone = (0.5 * 32767 * np.sin(2 * np.pi * 440 * t)).astype("<i2")
++    out = server.pcm16_bytes_to_float32(tone.tobytes(), 8000)
++    assert out.dtype == np.float32
++    assert abs(len(out) - 16000) <= 2
++    # A 440 Hz tone must stay a 440 Hz tone (byte-swapped samples would be broadband noise).
++    spectrum = np.abs(np.fft.rfft(out))
++    peak_hz = np.argmax(spectrum) * 16000 / len(out)
++    assert abs(peak_hz - 440) < 5
++
++
++def test_enrollment_roundtrip_bytes_are_le():
++    native = np.array([1, -2, 300, -400], dtype=np.int16)
++    out = server.pcm16_bytes_to_float32(native.astype(server._PCM16LE).tobytes(), 16000)
++    np.testing.assert_allclose(out, native.astype(np.float32) / 32768.0, atol=0)
